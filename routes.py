@@ -50,7 +50,7 @@ def get_db() -> AsyncIOMotorDatabase:
 async def register(user: UserCreate):
     """Register a new user"""
     db = get_db()
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     # Check if user already exists
     existing_user = await db.users.find_one({"email": user.email})
     if existing_user:
