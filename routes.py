@@ -34,6 +34,14 @@ GROQ_MODEL = os.getenv("GROQ_MODEL")
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
+def parse_local_datetime(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    s = str(value).strip().replace("Z", "")
+    return datetime.fromisoformat(s).replace(tzinfo=None)
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -77,8 +85,10 @@ async def register(user: UserCreate):
         "password": hash_password(user.password),
         "role": user.role,
         "operative_type": user.operative_type,
+        "pay_rate": user.pay_rate if hasattr(user, 'pay_rate') and user.pay_rate else None,
         "created_at": datetime.utcnow()
     }
+    # import pdb;pdb.set_trace()
     
     # Save to MongoDB
     result = await db.users.insert_one(user_doc)
@@ -405,7 +415,7 @@ async def start_job_log(
     job_log = {
         "job_id": job_id,
         "operative_id": operative_id,
-        "arrival_time": datetime.utcnow(),
+        "created_at": datetime.utcnow(),
         "is_complete": False,
         "vehicles": [],
         "plant_items": [],
@@ -459,7 +469,8 @@ async def update_job_log(
         update_doc["notes"] = log_data.notes
     
     if log_data.logout_time is not None:
-        update_doc["logout_time"] = log_data.logout_time
+        update_doc["logout_time"] = parse_local_datetime(log_data.logout_time)
+
     
     await db.job_logs.update_one(
         {"_id": job_log["_id"]},
@@ -488,43 +499,49 @@ async def complete_job_log(
     
     if not job_log:
         raise HTTPException(status_code=404, detail="Job log not found")
-    # Get arrival_time
-    arrival_time = job_log["arrival_time"]
-    if isinstance(arrival_time, str):
-        arrival_time = datetime.fromisoformat(
-            arrival_time.replace('Z', '+00:00')
-        ).replace(tzinfo=None)
 
-    # Get departure_time from logout_time
+    if job_log.get("is_complete", False):
+        raise HTTPException(status_code=400, detail="Job already completed")
+
+    # Arrival comes from the vehicle(s) the operative logged, not the server clock.
+    # If more than one vehicle, use the earliest arrival.
+    vehicle_arrivals = [
+        parse_local_datetime(v.get("arrival_time"))
+        for v in job_log.get("vehicles", [])
+        if v.get("arrival_time")
+    ]
+    if not vehicle_arrivals:
+        raise HTTPException(
+            status_code=400,
+            detail="Arrival time is required. Add a vehicle with an arrival time before completing."
+        )
+    arrival_time = min(vehicle_arrivals)
+
+    # Departure is the logout_time the operative entered
     logout_time_raw = job_log.get("logout_time")
-    if logout_time_raw:
-        if isinstance(logout_time_raw, str):
-            departure_time = datetime.fromisoformat(
-                logout_time_raw.replace('Z', '+00:00')
-            ).replace(tzinfo=None)
-            if departure_time < arrival_time:
-                departure_time = departure_time.replace(
-                    year=arrival_time.year,
-                    month=arrival_time.month,
-                    day=arrival_time.day
-                )
-            if departure_time < arrival_time:
-                departure_time = datetime.utcnow()
-        else:
-            departure_time = logout_time_raw
-    else:
-        departure_time = datetime.utcnow()
+    if not logout_time_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="Logout time is required before completing the job."
+        )
+    departure_time = parse_local_datetime(logout_time_raw)
+
+    if departure_time <= arrival_time:
+        raise HTTPException(
+            status_code=400,
+            detail="Logout time must be after arrival time"
+        )
 
     hours_on_site = round(
         (departure_time - arrival_time).total_seconds() / 3600, 2
     )
-    # Get user's pay rate
+
     user = await db.users.find_one({"_id": current_user["_id"]})
-    pay_rate = user.get("pay_rate", 0.0)
+    pay_rate = user.get("pay_rate", 0.0) or 0.0
     labour_cost = round(hours_on_site * pay_rate, 2)
-    import pdb;pdb.set_trace()
-    # Update job log
+
     update_doc = {
+        "arrival_time": arrival_time,  
         "departure_time": departure_time,
         "is_complete": True,
         "hours_on_site": hours_on_site,
@@ -797,7 +814,7 @@ async def ai_cost_analysis(
                 },
                 {
                     "role": "user",
-                    "content": request.json()
+                    "content": f"Job Title: {request.job_title}, Job Type: {request.job_type}, Hours on Site: {request.hours_on_site}, Labour Cost: £{request.labour_cost}, Plant Cost: £{request.plant_cost}, Materials Cost: £{request.materials_cost}, Total Cost: £{request.total_cost}, Operatives: {', '.join(request.operative_names)}, Notes: {request.notes or 'None'}"
                 }
             ],
             "max_tokens": 150

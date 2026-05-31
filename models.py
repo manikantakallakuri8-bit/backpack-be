@@ -23,6 +23,7 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     role: UserRole
+    pay_rate: Optional[float] = None
     operative_type: Optional[OperativeType] = None
 
     class Config:
